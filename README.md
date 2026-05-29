@@ -1,4 +1,4 @@
-# 🔧 Fix: `final_model.pt not found` on Streamlit Cloud
+# 🔧 Fix: `final_model.pt found` on Streamlit Cloud
 
 ## Root Cause
 GitHub blocks files > 100 MB. Your `final_model.pt` lives only on your Mac
