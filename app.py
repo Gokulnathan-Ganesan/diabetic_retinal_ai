@@ -1,369 +1,301 @@
-import sys, os, warnings
+"""
+app.py  —  DR Grading Streamlit App
+────────────────────────────────────
+Run:
+    streamlit run app.py
+
+Expects  artifacts/  in the same directory:
+    artifacts/final_model.pt
+    artifacts/fundus_validator_v3.pt
+"""
+
+import warnings
 warnings.filterwarnings("ignore")
-from pathlib import Path
-
-import streamlit as st
-st.set_page_config(
-    page_title="DR Grading — AI-Assisted Diabetic Retinopathy Detection",
-    page_icon="🧪",
-    layout="centered",
-)
-
-# ── Model download from Hugging Face Hub (Streamlit Cloud fix) ─────────────────
-# Change this to your actual HF repo: "your-hf-username/dr-grading-v13"
-HF_REPO_ID = "YOUR_HF_USERNAME/dr-grading-v13"
-
-@st.cache_resource(show_spinner="📥 Downloading models from Hugging Face Hub...")
-def _download_artifacts() -> Path:
-    """Download model files from HuggingFace Hub to /tmp on Streamlit Cloud.
-    Cached so it only runs once per cold start."""
-    local_dir = Path("/tmp/dr_artifacts")
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    files_needed = ["final_model.pt", "fundus_validator_v3.pt"]
-    missing = [f for f in files_needed if not (local_dir / f).exists()]
-
-    if not missing:
-        return local_dir
-
-    # Read HF token from Streamlit secrets (set in Streamlit Cloud dashboard)
-    token = None
-    try:
-        token = st.secrets.get("HF_TOKEN", None)
-    except Exception:
-        token = os.environ.get("HF_TOKEN", None)
-
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError:
-        st.error("❌ huggingface-hub not installed. Add it to requirements.txt.")
-        st.stop()
-
-    for fname in missing:
-        try:
-            hf_hub_download(
-                repo_id=HF_REPO_ID,
-                filename=fname,
-                repo_type="model",
-                local_dir=str(local_dir),
-                token=token,
-            )
-        except Exception as e:
-            st.error(
-                f"❌ Could not download `{fname}` from `{HF_REPO_ID}`.\n\n"
-                f"**Error:** {e}\n\n"
-                "**Fix checklist:**\n"
-                "- Set `HF_REPO_ID` in app.py to your actual HF repo\n"
-                "- Upload model files to that HF repo\n"
-                "- Add `HF_TOKEN` to Streamlit Cloud → Settings → Secrets (private repos)"
-            )
-            st.stop()
-
-    return local_dir
-
-
-# Resolve ARTIFACTS: prefer local artifacts/ folder (local dev), then HF Hub (cloud)
-_local_artifacts = Path(__file__).parent / "artifacts"
-if _local_artifacts.exists() and ((_local_artifacts / "final_model.pt").exists()):
-    ARTIFACTS = _local_artifacts          # ✅ local dev — use local files directly
-else:
-    ARTIFACTS = _download_artifacts()     # ✅ Streamlit Cloud — download from HF Hub
-
 
 import numpy as np
 import cv2
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import timm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
+import altair as alt
+import pandas as pd
+import streamlit as st
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-GRADE_MAP = {0:"No DR", 1:"Mild DR", 2:"Moderate DR", 3:"Severe DR", 4:"Proliferative DR"}
-GRADE_COLORS = ["#2ecc71","#f1c40f","#e67e22","#e74c3c","#8e44ad"]
-GRADE_ADVICE = {
-    0: "No diabetic retinopathy detected. Recommended follow-up: 1-2 years.",
-    1: "Mild NPDR. Ophthalmology follow-up in 12 months.",
-    2: "Moderate NPDR. Ophthalmology review in 6 months.",
-    3: "Severe NPDR. Urgent review within 1-2 months.",
-    4: "Proliferative DR. Immediate ophthalmology referral required.",
-}
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+from model_loader import (
+    load_dr_model,
+    load_fv_ensemble,
+    DEVICE,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    GRADE_MAP,
+    GRADE_COLORS,
+    GRADE_ADVICE,
+)
 
-# ── Preprocessing ─────────────────────────────────────────────────────────────
-def apply_clahe_lab(rgb):
+# ─────────────────────────────────────────────────────────────────────────────
+#  PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="DR Grading — AI-Assisted Diabetic Retinopathy Detection",
+    page_icon="🩺",
+    layout="centered",
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  IMAGE PREPROCESSING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_clahe_lab(rgb: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     lab[:, :, 0] = clahe.apply(lab[:, :, 0])
     return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
-def retinal_mask(rgb):
+
+def retinal_mask(rgb: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     _, mask = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
-    kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-def crop_retinal_disc(rgb):
+
+def crop_retinal_disc(rgb: np.ndarray) -> np.ndarray:
     mask = retinal_mask(rgb)
     ys, xs = np.where(mask > 0)
-    if len(ys) < 100: return rgb
-    return rgb[int(ys.min()):int(ys.max()), int(xs.min()):int(xs.max())]
+    if len(ys) < 100:
+        return rgb
+    return rgb[int(ys.min()): int(ys.max()), int(xs.min()): int(xs.max())]
 
-def preprocess(pil_img, size=512):
+
+def preprocess(pil_img: Image.Image, size: int = 512) -> np.ndarray:
     rgb = np.array(pil_img.convert("RGB"))
-    try:    rgb = apply_clahe_lab(crop_retinal_disc(rgb))
-    except: pass
+    try:
+        rgb = apply_clahe_lab(crop_retinal_disc(rgb))
+    except Exception:
+        pass
     return cv2.resize(rgb, (size, size))
 
-# ── DR Model ──────────────────────────────────────────────────────────────────
-class GeM(nn.Module):
-    def __init__(self, p=3.0, eps=1e-6):
-        super().__init__(); self.p = nn.Parameter(torch.tensor(p)); self.eps = eps
-    def forward(self, x):
-        return F.adaptive_avg_pool2d(x.clamp(min=self.eps).pow(self.p), 1).pow(1.0/self.p)
 
-class DRHead(nn.Module):
-    def __init__(self, in_f, nc=5, d=0.4):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_f, 1024), nn.BatchNorm1d(1024), nn.SiLU(), nn.Dropout(d),
-            nn.Linear(1024, 512),  nn.BatchNorm1d(512),  nn.SiLU(), nn.Dropout(d/2),
-            nn.Linear(512, nc))
-    def forward(self, x): return self.net(x)
+# ─────────────────────────────────────────────────────────────────────────────
+#  FUNDUS GATING
+# ─────────────────────────────────────────────────────────────────────────────
 
-class DRModel(nn.Module):
-    def __init__(self, backbone="tf_efficientnetv2_s", nc=5):
-        super().__init__()
-        self.backbone = timm.create_model(backbone, pretrained=False, num_classes=0, global_pool="")
-        self.pool = GeM(); self.head = DRHead(self.backbone.num_features, nc)
-    def forward(self, x):
-        feat = self.pool(self.backbone(x)).flatten(1)
-        return self.head(feat), feat
-
-# ── Fundus Validator Ensemble ─────────────────────────────────────────────────
-_FV_SPECS = [
-    ("mobilenetv3_large_100.ra_in1k", "avg", 0.25),
-    ("convnext_tiny.fb_in22k",         "avg", 0.45),
-    ("convnext_tiny.in12k_ft_in1k",    "avg", 0.30),
-]
-FV_SIZE = 224
-
-class _SingleFV(nn.Module):
-    def __init__(self, name, pool="avg"):
-        super().__init__()
-        self.backbone = timm.create_model(name, pretrained=False, num_classes=0, global_pool=pool)
-        for p in self.backbone.parameters(): p.requires_grad = False
-        self.backbone.eval()
-        with torch.no_grad():
-            fd = self.backbone(torch.zeros(1, 3, FV_SIZE, FV_SIZE)).shape[1]
-        self.head = nn.Sequential(
-            nn.LayerNorm(fd), nn.Linear(fd, 256), nn.GELU(), nn.Dropout(0.3), nn.Linear(256, 2))
-    def extract_features(self, x):
-        with torch.no_grad(): return self.backbone(x)
-    def forward(self, x): return self.head(self.extract_features(x))
-
-class FVEnsemble(nn.Module):
-    def __init__(self, specs):
-        super().__init__()
-        self.validators = nn.ModuleList([_SingleFV(n, p) for n, p, _ in specs])
-        ws = [w for _, _, w in specs]; t = sum(ws); self.weights = [w/t for w in ws]
-    def extract_primary_features(self, x):
-        return self.validators[1].extract_features(x)
-    def forward(self, x):
-        avg = None
-        for val, w in zip(self.validators, self.weights):
-            p = F.softmax(val(x), dim=1)
-            avg = p*w if avg is None else avg+p*w
-        return torch.log(avg.clamp(min=1e-9))
-
-# ── Load models ───────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner="Loading DR grading model...")
-def load_dr_model():
-    ckpt_path = ARTIFACTS / "final_model.pt"
-    if not ckpt_path.exists():
-        return None, None, None, {}
-    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-    m = DRModel(ckpt.get("backbone", "tf_efficientnetv2_s")).to(DEVICE)
-    m.load_state_dict(ckpt["model_state"]); m.eval()
-    return m, int(ckpt.get("img_size", 512)), float(ckpt.get("temperature", 1.0)), ckpt.get("val_metrics", {})
-
-@st.cache_resource(show_spinner="Loading fundus validator ensemble...")
-def load_fv_ensemble():
-    ckpt_path = ARTIFACTS / "fundus_validator_v3.pt"
-    if not ckpt_path.exists():
-        return None, None, None
-    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-    specs = ckpt.get("backbone_specs", _FV_SPECS)
-    fv = FVEnsemble(specs).to(DEVICE)
-    for val, hs in zip(fv.validators, ckpt["head_state_list"]):
-        val.head.load_state_dict(hs)
-    fv.eval()
-    tfm = A.Compose([
-        A.Resize(FV_SIZE, FV_SIZE),
-        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ToTensorV2()])
-    md = {k: ckpt.get(k) for k in ["feat_mean", "feat_cov_inv", "mahal_threshold"]}
-    return fv, tfm, md
-
-# ── Heuristics + gate ─────────────────────────────────────────────────────────
 STRONG_H = {"red_dominance": 0.60, "disc_coverage": 0.35, "edge_density": 0.010}
 WEAK_H   = {"red_dominance": 0.35, "disc_coverage": 0.15, "edge_density": 0.008}
 
-def fundus_heuristics(rgb):
-    r, g, b = rgb[...,0].astype(np.float32), rgb[...,1].astype(np.float32), rgb[...,2].astype(np.float32)
-    bright = (r>15)|(g>15)|(b>15); nb = int(bright.sum())
-    rd = float(((r>g)&(r>b))[bright].mean()) if nb>100 else float(((r>g)&(r>b)).mean())
-    dc = float(retinal_mask(rgb).mean()/255.0)
-    gy = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    mag = np.sqrt(cv2.Sobel(gy, cv2.CV_32F, 1, 0, ksize=3)**2
-                + cv2.Sobel(gy, cv2.CV_32F, 0, 1, ksize=3)**2)
-    ed = float(mag[bright].mean()/255.0) if nb>100 else float(mag.mean()/255.0)
+
+def fundus_heuristics(rgb: np.ndarray) -> dict:
+    r = rgb[..., 0].astype(np.float32)
+    g = rgb[..., 1].astype(np.float32)
+    b = rgb[..., 2].astype(np.float32)
+    bright = (r > 15) | (g > 15) | (b > 15)
+    nb = int(bright.sum())
+
+    rd = float(((r > g) & (r > b))[bright].mean()) if nb > 100 else float(((r > g) & (r > b)).mean())
+    dc = float(retinal_mask(rgb).mean() / 255.0)
+
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    mag  = np.sqrt(
+        cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3) ** 2 +
+        cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3) ** 2
+    )
+    ed = float(mag[bright].mean() / 255.0) if nb > 100 else float(mag.mean() / 255.0)
     return {"red_dominance": rd, "disc_coverage": dc, "edge_density": ed}
 
-def gate_fundus_st(pil_img, fv, tfm, md):
+
+def gate_fundus(pil_img: Image.Image, fv, tfm, mahal_data: dict):
+    """Returns (is_fundus: bool, ensemble_prob: float, heuristics: dict, reason: str)."""
     rgb_raw = np.array(pil_img.convert("RGB"))
-    try:    rgb = apply_clahe_lab(crop_retinal_disc(rgb_raw))
-    except: rgb = rgb_raw
+    try:
+        rgb = apply_clahe_lab(crop_retinal_disc(rgb_raw))
+    except Exception:
+        rgb = rgb_raw
+
     h = fundus_heuristics(rgb)
     x = tfm(image=rgb)["image"].unsqueeze(0).to(DEVICE)
+
     with torch.no_grad():
         pf = float(F.softmax(fv(x), dim=1).cpu().numpy()[0][1])
+
     s_ok = all(h[k] >= v for k, v in STRONG_H.items())
     w_ok = all(h[k] >= v for k, v in WEAK_H.items())
-    if s_ok:                                       return True,  pf, h, "Strong visual signatures"
-    if pf >= 0.75:                                 return True,  pf, h, f"Ensemble confidence {pf*100:.1f}%"
-    if pf >= 0.50 and w_ok:                        return True,  pf, h, "Ensemble + heuristics"
-    if h["disc_coverage"] >= 0.25 and pf >= 0.35: return True,  pf, h, f"Clear disc (cov={h['disc_coverage']:.2f})"
-    if md and md.get("feat_mean") is not None:
-        fm  = torch.from_numpy(np.asarray(md["feat_mean"])).to(DEVICE)
-        fci = torch.from_numpy(np.asarray(md["feat_cov_inv"])).to(DEVICE)
-        thr = float(md["mahal_threshold"])
+
+    if s_ok:
+        return True, pf, h, "Strong visual signatures"
+    if pf >= 0.75:
+        return True, pf, h, f"Ensemble confidence {pf * 100:.1f}%"
+    if pf >= 0.50 and w_ok:
+        return True, pf, h, "Ensemble + heuristics"
+    if h["disc_coverage"] >= 0.25 and pf >= 0.35:
+        return True, pf, h, f"Clear disc (cov={h['disc_coverage']:.2f})"
+
+    # Mahalanobis fallback
+    if mahal_data and mahal_data.get("feat_mean") is not None:
+        fm  = torch.from_numpy(np.asarray(mahal_data["feat_mean"])).to(DEVICE)
+        fci = torch.from_numpy(np.asarray(mahal_data["feat_cov_inv"])).to(DEVICE)
+        thr = float(mahal_data["mahal_threshold"])
         with torch.no_grad():
             feats = fv.extract_primary_features(x).squeeze(0)
-        d = float(torch.sqrt(torch.clamp(
-            torch.einsum("i,ij,j->", feats-fm, fci, feats-fm), min=0.)).cpu())
-        if d <= thr: return True, pf, h, f"Feature similarity (d={d:.1f})"
+        dist = float(torch.sqrt(
+            torch.clamp(torch.einsum("i,ij,j->", feats - fm, fci, feats - fm), min=0.0)
+        ).cpu())
+        if dist <= thr:
+            return True, pf, h, f"Feature similarity (d={dist:.1f})"
+
     return False, pf, h, "Not a fundus image"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DR PREDICTION
+# ─────────────────────────────────────────────────────────────────────────────
+
 @torch.no_grad()
-def predict_dr(pil_img, dr_model, img_size, temperature):
+def predict_dr(pil_img: Image.Image, dr_model, img_size: int, temperature: float):
+    """Returns (grade: int, probs: np.ndarray, preprocessed_rgb: np.ndarray)."""
     rgb = preprocess(pil_img, img_size)
     tfm = A.Compose([
         A.Resize(img_size, img_size),
         A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ToTensorV2()])
+        ToTensorV2(),
+    ])
     x = tfm(image=rgb)["image"].unsqueeze(0).to(DEVICE)
     logits, _ = dr_model(x)
     probs = F.softmax(logits / max(temperature, 0.05), dim=1).cpu().numpy()[0]
     return int(np.argmax(probs)), probs, rgb
 
-# ── UI ────────────────────────────────────────────────────────────────────────
-st.title("🧪 Diabetic Retinopathy Grading")
-st.caption("AI-assisted grading | Research use only — not for clinical decisions")
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN UI
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.title("🩺 Diabetic Retinopathy Grading")
+st.caption("AI-assisted grading  |  ⚠️ Research use only — not for clinical decisions")
+
+# Load models (cached)
 dr_model, img_size, temperature, val_metrics = load_dr_model()
-fv_result = load_fv_ensemble()
+fv, fv_tfm, mahal_data = load_fv_ensemble()
 
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("ℹ️ About")
     st.markdown("""
-**DR Grading v13**
+**DR Grading v19**
 - Backbone: EfficientNetV2-S + GeM
 - Domain adapt: DeepCORAL
 - Calibration: Temperature scaling
 - Validator: MobileNetV3 + ConvNeXt ensemble
+- Resolution: adaptive (512 / 1024 px)
 """)
-    # ── Model status ──────────────────────────────────────────────────────────
+
     if dr_model is None:
-        st.error("⚠️ `final_model.pt` not found.\n\nUpload it to your HF repo and set `HF_REPO_ID` in app.py.")
-    elif fv_result[0] is None:
-        st.warning("⚠️ `fundus_validator_v3.pt` missing — fundus gate disabled.")
+        st.error("⚠️ `final_model.pt` not found\n\nCopy `artifacts/` folder here.")
+    elif fv is None:
+        st.error("⚠️ `fundus_validator_v3.pt` missing")
     else:
         st.success("✅ Models loaded")
         if val_metrics:
-            st.metric("Val QWK", f"{val_metrics.get('qwk', 0):.4f}")
+            st.metric("Val QWK",       f"{val_metrics.get('qwk', 0):.4f}")
+            st.metric("Val Accuracy",  f"{val_metrics.get('acc', 0):.4f}")
+        st.metric("Image size",    f"{img_size} px")
         st.metric("Temperature T", f"{temperature:.3f}")
-        st.caption(f"Source: `{'local' if _local_artifacts.exists() else 'HuggingFace Hub'}`")
-    st.divider()
-    st.error("⚠️ RESEARCH ONLY, Not validated for clinical use.")
+        st.metric("Device",        DEVICE.upper())
 
+    st.divider()
+    st.error("⚠️ RESEARCH ONLY\nNot validated for clinical use.")
+
+# ── Upload ────────────────────────────────────────────────────────────────────
 uploaded = st.file_uploader(
     "Upload a retinal fundus photograph",
     type=["jpg", "jpeg", "png", "bmp"],
-    help="200MB per file • JPG, PNG, BMP")
+)
 
-if uploaded is not None:
-    pil_img = Image.open(uploaded)
-    col1, col2 = st.columns(2)
-    with col1:
-        st.image(pil_img, caption="Uploaded image", use_container_width=True)
+if uploaded is None:
+    st.info("👆 Upload a fundus photo to get started.")
+    st.stop()
 
-    if dr_model is None:
-        st.error("DR model not loaded — see sidebar."); st.stop()
+pil_img = Image.open(uploaded)
+col1, col2 = st.columns(2)
 
-    # Fundus gate (skip gracefully if validator missing)
-    if fv_result[0] is not None:
-        fv, fv_tfm, mahal_data = fv_result
-        with st.spinner("Validating fundus image..."):
-            is_fundus, pf, heur, fv_reason = gate_fundus_st(pil_img, fv, fv_tfm, mahal_data)
+with col1:
+    st.image(pil_img, caption="Uploaded image", use_container_width=True)
 
-        if not is_fundus:
-            st.error(f"🚫 **Image rejected** — {fv_reason}")
-            st.info("Please upload a colour retinal fundus photograph.")
-            with st.expander("Validator details"):
-                st.write(f"Ensemble score: {pf*100:.1f}%")
-                for k, v in heur.items():
-                    thr = WEAK_H[k]
-                    icon = "✅" if v >= thr else "❌"
-                    st.write(f"{icon} {k}: {v:.4f} (need ≥ {thr})")
-            st.stop()
+# ── Guard: models loaded? ─────────────────────────────────────────────────────
+if dr_model is None or fv is None:
+    st.error("Models not loaded — see sidebar.")
+    st.stop()
 
-        st.success(f"✅ Fundus confirmed — {fv_reason}")
-    else:
-        st.warning("⚠️ Fundus validator not loaded — skipping image validation.")
+# ── Fundus gate ───────────────────────────────────────────────────────────────
+with st.spinner("Validating fundus image…"):
+    is_fundus, pf, heur, fv_reason = gate_fundus(pil_img, fv, fv_tfm, mahal_data)
 
-    with st.spinner("Grading DR severity..."):
-        pred, probs, proc_rgb = predict_dr(pil_img, dr_model, img_size, temperature)
+if not is_fundus:
+    st.error(f"🚫 **Image rejected** — {fv_reason}")
+    st.info("Please upload a colour retinal fundus photograph.")
+    with st.expander("Validator details"):
+        st.write(f"Ensemble score: {pf * 100:.1f}%")
+        for k, v in heur.items():
+            thr  = WEAK_H[k]
+            icon = "✅" if v >= thr else "❌"
+            st.write(f"{icon} {k}: {v:.4f}  (need ≥ {thr})")
+    st.stop()
 
-    with col2:
-        st.image(proc_rgb, caption="Preprocessed (CLAHE + retinal crop)", use_container_width=True)
+st.success(f"✅ Fundus confirmed — {fv_reason}")
 
-    grade_color = GRADE_COLORS[pred]
-    st.markdown(f"## Grade {pred}: {GRADE_MAP[pred]}")
-    st.markdown(
-        f'<div style="padding:16px;border-radius:8px;background:{grade_color}22;'
-        f'border-left:6px solid {grade_color};">'
-        f'<strong>{GRADE_ADVICE[pred]}</strong></div>',
-        unsafe_allow_html=True)
-    st.divider()
+# ── DR grading ────────────────────────────────────────────────────────────────
+with st.spinner("Grading DR severity…"):
+    pred, probs, proc_rgb = predict_dr(pil_img, dr_model, img_size, temperature)
 
-    st.subheader("Grade probabilities")
-    import altair as alt
-    import pandas as pd
-    df_p = pd.DataFrame({
-        "Grade":       [f"G{i}: {GRADE_MAP[i]}" for i in range(5)],
-        "Probability": probs.tolist(),
-        "Color":       GRADE_COLORS,
-    })
-    chart = (
-        alt.Chart(df_p).mark_bar()
-        .encode(
-            x=alt.X("Probability:Q", scale=alt.Scale(domain=[0, 1])),
-            y=alt.Y("Grade:N", sort=None),
-            color=alt.Color("Color:N", scale=None, legend=None),
-            tooltip=["Grade", alt.Tooltip("Probability", format=".3f")])
-        .properties(height=180))
-    st.altair_chart(chart, use_container_width=True)
-    st.caption(f"Temperature: {temperature:.3f} | Confidence: {probs[pred]*100:.1f}%")
+with col2:
+    st.image(proc_rgb, caption="Preprocessed (CLAHE + retinal crop)", use_container_width=True)
 
-    with st.expander("Full probability table"):
-        st.dataframe(pd.DataFrame({
+# ── Result card ───────────────────────────────────────────────────────────────
+grade_color = GRADE_COLORS[pred]
+st.markdown(f"## Grade {pred}: {GRADE_MAP[pred]}")
+st.markdown(
+    f'<div style="padding:16px;border-radius:8px;'
+    f'background:{grade_color}22;border-left:6px solid {grade_color};">'
+    f"<strong>{GRADE_ADVICE[pred]}</strong></div>",
+    unsafe_allow_html=True,
+)
+st.divider()
+
+# ── Probability chart ─────────────────────────────────────────────────────────
+st.subheader("Grade probabilities")
+df_p = pd.DataFrame({
+    "Grade":       [f"G{i}: {GRADE_MAP[i]}" for i in range(5)],
+    "Probability": probs.tolist(),
+    "Color":       GRADE_COLORS,
+})
+chart = (
+    alt.Chart(df_p)
+    .mark_bar()
+    .encode(
+        x=alt.X("Probability:Q", scale=alt.Scale(domain=[0, 1])),
+        y=alt.Y("Grade:N", sort=None),
+        color=alt.Color("Color:N", scale=None, legend=None),
+        tooltip=["Grade", alt.Tooltip("Probability", format=".3f")],
+    )
+    .properties(height=180)
+)
+st.altair_chart(chart, use_container_width=True)
+st.caption(
+    f"Temperature: {temperature:.3f}  |  "
+    f"Confidence: {probs[pred] * 100:.1f}%  |  "
+    f"Device: {DEVICE.upper()}"
+)
+
+# ── Full probability table ────────────────────────────────────────────────────
+with st.expander("Full probability table"):
+    st.dataframe(
+        pd.DataFrame({
             "Grade":            [GRADE_MAP[i] for i in range(5)],
-            "Probability (%)":  [f"{p*100:.2f}" for p in probs]}))
+            "Probability (%)":  [f"{p * 100:.2f}" for p in probs],
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    st.divider()
-    st.caption("⚠️ Research use only — not for clinical diagnosis.")
+st.divider()
+st.caption("⚠️ Research use only — not for clinical diagnosis.")
