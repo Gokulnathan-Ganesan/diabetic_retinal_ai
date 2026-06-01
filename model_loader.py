@@ -1,151 +1,213 @@
 """
-model_loader.py  —  Drop this file next to app.py in your GitHub repo.
+model_loader.py
+───────────────
+All model definitions + cached loaders for the DR Grading Streamlit app.
 
-It auto-downloads final_model.pt (and optional companion files) from
-Hugging Face Hub at startup, so Streamlit Community Cloud never needs
-the artifacts/ folder on disk.
-
-SETUP (one-time, ~5 min):
-  1. Create a free account at https://huggingface.co
-  2. Create a NEW MODEL REPO  (e.g. "gokulnathan/dr-grading-v13")
-     → New → Model → set to Private (recommended for medical models)
-  3. Upload your artifacts from your Mac:
-       pip install huggingface_hub
-       python -c "
-         from huggingface_hub import HfApi
-         api = HfApi()
-         api.upload_file(
-             path_or_fileobj='/Users/gokulnathan/DR_data/artifacts/final_model.pt',
-             path_in_repo='final_model.pt',
-             repo_id='YOUR_HF_USERNAME/dr-grading-v13',
-             repo_type='model',
-         )
-         # Repeat for each artifact file you need:
-         # best_model.pt, fundus_validator_ensemble.pt,
-         # _resume_state.json, calibration.pt, etc.
-       "
-  4. If repo is Private, create a READ token at
-     https://huggingface.co/settings/tokens
-     and add it to Streamlit Cloud secrets:
-       Dashboard → your app → Settings → Secrets → paste:
-         HF_TOKEN = "hf_xxxxxxxxxxxx"
-  5. In your app.py, replace the old artifact-loading block with:
-       from model_loader import ensure_artifacts
-       ARTIFACT_DIR = ensure_artifacts()
+Models expected inside  artifacts/  (same directory as app.py):
+  artifacts/final_model.pt          ← DR grading checkpoint
+  artifacts/fundus_validator_v3.pt  ← Fundus ensemble validator checkpoint
 """
 
-import os
-import json
 from pathlib import Path
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import streamlit as st
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-# Change this to your actual HuggingFace repo: "username/repo-name"
-HF_REPO_ID = "YOUR_HF_USERNAME/dr-grading-v13"
+# ── Runtime constants ─────────────────────────────────────────────────────────
+DEVICE    = "cuda" if torch.cuda.is_available() else "mps" if (
+    hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else "cpu"
+ARTIFACTS = Path(__file__).parent / "artifacts"
 
-# Files to download from HF repo → local path (relative to ARTIFACT_DIR)
-# Add / remove entries to match what your app.py actually loads.
-ARTIFACT_FILES = [
-    "final_model.pt",
-    "best_model.pt",
-    "fundus_validator_ensemble.pt",
-    "calibration.pt",
-    "_resume_state.json",
-]
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
 
-# Local cache directory (writable on Streamlit Cloud)
-_LOCAL_ARTIFACT_DIR = Path(os.environ.get("ARTIFACT_DIR", "/tmp/dr_artifacts"))
+# ── Grade metadata ────────────────────────────────────────────────────────────
+GRADE_MAP = {
+    0: "No DR",
+    1: "Mild DR",
+    2: "Moderate DR",
+    3: "Severe DR",
+    4: "Proliferative DR",
+}
+GRADE_COLORS = ["#2ecc71", "#f1c40f", "#e67e22", "#e74c3c", "#8e44ad"]
+GRADE_ADVICE = {
+    0: "No diabetic retinopathy detected. Recommended follow-up: 1–2 years.",
+    1: "Mild NPDR. Ophthalmology follow-up in 12 months.",
+    2: "Moderate NPDR. Ophthalmology review in 6 months.",
+    3: "Severe NPDR. Urgent review within 1–2 months.",
+    4: "Proliferative DR. Immediate ophthalmology referral required.",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DR GRADING MODEL  (EfficientNetV2-S + GeM + dual head)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GeM(nn.Module):
+    """Generalised Mean Pooling with learnable exponent."""
+    def __init__(self, p: float = 3.0, eps: float = 1e-6):
+        super().__init__()
+        self.p   = nn.Parameter(torch.tensor(p))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.adaptive_avg_pool2d(
+            x.clamp(min=self.eps).pow(self.p), 1
+        ).pow(1.0 / self.p)
 
 
-def ensure_artifacts(
-    repo_id: str = HF_REPO_ID,
-    files: list[str] = ARTIFACT_FILES,
-    local_dir: Path = _LOCAL_ARTIFACT_DIR,
-    force: bool = False,
-) -> Path:
-    """
-    Download all required artifact files from HuggingFace Hub if not already
-    cached locally.  Returns the local artifact directory Path.
-
-    Call this ONCE at the top of app.py:
-        from model_loader import ensure_artifacts
-        ARTIFACT_DIR = ensure_artifacts()
-    """
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    # Collect only files that are missing (or force=True)
-    missing = [f for f in files if force or not (local_dir / f).exists()]
-
-    if not missing:
-        print(f"✅ All artifacts already cached at {local_dir}")
-        return local_dir
-
-    print(f"📥 Downloading {len(missing)} artifact(s) from {repo_id} ...")
-
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError:
-        raise RuntimeError(
-            "huggingface_hub is not installed.\n"
-            "Add  huggingface-hub  to your requirements.txt and redeploy."
+class DRHead(nn.Module):
+    """Classification head: Linear → BN → SiLU → Dropout × 2."""
+    def __init__(self, in_features: int, num_classes: int = 5, dropout: float = 0.4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features, 1024),
+            nn.BatchNorm1d(1024),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.SiLU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(512, num_classes),
         )
 
-    # Optional: read HF token from Streamlit secrets or env
-    token = _get_hf_token()
-
-    for fname in missing:
-        dest = local_dir / fname
-        print(f"   ⬇  {fname}")
-        try:
-            path = hf_hub_download(
-                repo_id=repo_id,
-                filename=fname,
-                repo_type="model",
-                local_dir=str(local_dir),
-                token=token,
-            )
-            print(f"      → {path}")
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to download '{fname}' from '{repo_id}'.\n"
-                f"Error: {e}\n\n"
-                "Checklist:\n"
-                "  • Repo ID is correct (username/repo-name)\n"
-                "  • File exists in the HF repo\n"
-                "  • HF_TOKEN secret is set in Streamlit Cloud (if repo is private)\n"
-                "  • huggingface-hub is in requirements.txt"
-            ) from e
-
-    print(f"✅ All artifacts downloaded to {local_dir}")
-    return local_dir
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
-def _get_hf_token() -> str | None:
+class DRModel(nn.Module):
+    """EfficientNetV2-S + GeM + classification head."""
+    def __init__(self, backbone: str = "tf_efficientnetv2_s", num_classes: int = 5):
+        super().__init__()
+        self.backbone = timm.create_model(
+            backbone, pretrained=False, num_classes=0, global_pool=""
+        )
+        self.pool = GeM()
+        self.head = DRHead(self.backbone.num_features, num_classes)
+
+    def forward(self, x: torch.Tensor):
+        feat = self.pool(self.backbone(x)).flatten(1)
+        return self.head(feat), feat
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FUNDUS VALIDATOR ENSEMBLE  (MobileNetV3 + ConvNeXt-22k + ConvNeXt-12k)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FV_SPECS_DEFAULT = [
+    ("mobilenetv3_large_100.ra_in1k", "avg", 0.25),
+    ("convnext_tiny.fb_in22k",        "avg", 0.45),
+    ("convnext_tiny.in12k_ft_in1k",   "avg", 0.30),
+]
+FV_SIZE = 224
+
+
+class _SingleFV(nn.Module):
+    """One backbone + lightweight classification head for fundus gating."""
+    def __init__(self, name: str, pool: str = "avg"):
+        super().__init__()
+        self.backbone = timm.create_model(
+            name, pretrained=False, num_classes=0, global_pool=pool
+        )
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        self.backbone.eval()
+        with torch.no_grad():
+            fd = self.backbone(torch.zeros(1, 3, FV_SIZE, FV_SIZE)).shape[1]
+        self.head = nn.Sequential(
+            nn.LayerNorm(fd),
+            nn.Linear(fd, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 2),
+        )
+
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return self.backbone(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.extract_features(x))
+
+
+class FVEnsemble(nn.Module):
+    """Weighted ensemble of fundus validators."""
+    def __init__(self, specs=None):
+        super().__init__()
+        specs = specs or _FV_SPECS_DEFAULT
+        self.validators = nn.ModuleList([_SingleFV(n, p) for n, p, _ in specs])
+        raw_w = [w for _, _, w in specs]
+        total = sum(raw_w)
+        self.weights = [w / total for w in raw_w]
+
+    def extract_primary_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns ConvNeXt-22k features (index 1) for Mahalanobis gating."""
+        return self.validators[1].extract_features(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg = None
+        for val, w in zip(self.validators, self.weights):
+            p = F.softmax(val(x), dim=1)
+            avg = p * w if avg is None else avg + p * w
+        return torch.log(avg.clamp(min=1e-9))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CACHED LOADERS  (called once per Streamlit session)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@st.cache_resource(show_spinner="Loading DR grading model…")
+def load_dr_model():
     """
-    Try to read HF token from:
-      1. Streamlit secrets  (st.secrets["HF_TOKEN"])
-      2. Environment variable HF_TOKEN
-    Returns None if not found (works for public repos).
+    Returns (model, img_size, temperature, val_metrics).
+    All four are None / {} if the checkpoint is missing.
     """
-    # Try Streamlit secrets first (only available when running in Streamlit)
-    try:
-        import streamlit as st
-        return st.secrets.get("HF_TOKEN", None)
-    except Exception:
-        pass
+    ckpt_path = ARTIFACTS / "final_model.pt"
+    if not ckpt_path.exists():
+        return None, None, None, {}
 
-    # Fallback to env var
-    return os.environ.get("HF_TOKEN", None)
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    backbone = ckpt.get("backbone", "tf_efficientnetv2_s")
+    model = DRModel(backbone).to(DEVICE)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    img_size    = int(ckpt.get("img_size", 512))
+    temperature = float(ckpt.get("temperature", 1.0))
+    val_metrics = ckpt.get("val_metrics", {})
+    return model, img_size, temperature, val_metrics
 
 
-# ── Quick self-test (run this file directly to verify) ────────────────────────
-if __name__ == "__main__":
-    import sys
+@st.cache_resource(show_spinner="Loading fundus validator ensemble…")
+def load_fv_ensemble():
+    """
+    Returns (fv_model, transform, mahal_data).
+    All three are None if the checkpoint is missing.
+    """
+    ckpt_path = ARTIFACTS / "fundus_validator_v3.pt"
+    if not ckpt_path.exists():
+        return None, None, None
 
-    if len(sys.argv) > 1:
-        HF_REPO_ID = sys.argv[1]   # pass repo_id as arg
+    ckpt  = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    specs = ckpt.get("backbone_specs", _FV_SPECS_DEFAULT)
+    fv    = FVEnsemble(specs).to(DEVICE)
 
-    print(f"Testing download from: {HF_REPO_ID}")
-    artifact_dir = ensure_artifacts(force=True)
-    print("\nFiles in artifact dir:")
-    for p in sorted(artifact_dir.iterdir()):
-        print(f"  {p.name}  ({p.stat().st_size / 1e6:.1f} MB)")
+    for val, head_state in zip(fv.validators, ckpt["head_state_list"]):
+        val.head.load_state_dict(head_state)
+    fv.eval()
+
+    tfm = A.Compose([
+        A.Resize(FV_SIZE, FV_SIZE),
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ToTensorV2(),
+    ])
+    mahal_data = {
+        k: ckpt.get(k)
+        for k in ("feat_mean", "feat_cov_inv", "mahal_threshold")
+    }
+    return fv, tfm, mahal_data
