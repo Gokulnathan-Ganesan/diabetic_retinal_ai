@@ -1,4 +1,4 @@
-# ─── DR Grading Streamlit App — requirements ───────────────────────────────
+# DR Grading Streamlit App — requirements
 # Python 3.10 / 3.11 recommended
 # Install: pip install -r requirements.txt
 
@@ -9,7 +9,7 @@ timm>=0.9.16
 
 # ── Image processing ──────────────────────────────────────────────────────────
 albumentations>=1.4.0
-opencv-python-headless>=4.8.0   # headless = no GUI deps (server-safe)
+opencv-python-headless>=4.8.0
 Pillow>=10.0.0
 
 # ── Data / numerics ───────────────────────────────────────────────────────────
